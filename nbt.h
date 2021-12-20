@@ -1,6 +1,12 @@
 #ifndef _NBT
 #define _NBT
 
+#ifndef _NBT_NO_COMPRESS
+#include <zlib/zlib.h>
+#define _NBT_GZIP_MAGIC 0x1f
+#define _NBT_GZIP_CHUNK 0x2000
+#endif
+
 #include <string>
 #include <cstdio>
 #include <numbers>
@@ -304,7 +310,7 @@ namespace nbt {
 
 		virtual void read(bytestream& input, int depth, size_tracker& size_tracker) override {
 			size_tracker.read(96);
-			uint64 i = input.read_int(32);
+			uint32 i = (uint32)input.read_int(32);
 			m_data = *(float*)&i;
 		}
 
@@ -395,7 +401,7 @@ namespace nbt {
 
 		virtual void read(bytestream& input, int depth, size_tracker& size_tracker) override {
 			size_tracker.read(96);
-			m_data = (int8_t)input.read_int(32);
+			m_data = (int32_t)input.read_int(32);
 		}
 
 		inline virtual std::int16_t get_short() const override {
@@ -440,7 +446,7 @@ namespace nbt {
 
 		virtual void read(bytestream& input, int depth, size_tracker& size_tracker) override {
 			size_tracker.read(128);
-			m_data = (int8_t)input.read_int(64);
+			m_data = (int64_t)input.read_int(64);
 		}
 
 		inline virtual std::int16_t get_short() const override {
@@ -503,8 +509,10 @@ namespace nbt {
 
 		virtual void write(byteoutstream& output) override {
 			output.write_int(32, m_dataSize);
-			if (m_dataSize && mp_data)
-				output.write((uint8*)mp_data, m_dataSize * 4);
+			if (m_dataSize && mp_data) {
+				for (int i = 0; i < m_dataSize; i++)
+					output.write_int(32, mp_data[i]);
+			}
 		}
 
 		virtual void read(bytestream& input, int depth, size_tracker& size_tracker) override {
@@ -514,7 +522,8 @@ namespace nbt {
 			if (m_dataSize) {
 				size_tracker.read(8 * 4 * m_dataSize);
 				mp_data = new std::int32_t[m_dataSize];
-				input.read_to((uint8*)mp_data, m_dataSize * 4);
+				for (int i = 0; i < m_dataSize; i++)
+					mp_data[i] = input.read_int(32);
 			}
 		}
 
@@ -565,8 +574,10 @@ namespace nbt {
 
 		virtual void write(byteoutstream& output) override {
 			output.write_int(32, m_dataSize);
-			if (m_dataSize && mp_data)
-				output.write((uint8*)mp_data, m_dataSize * 8);
+			if (m_dataSize && mp_data) {
+				for (int i = 0; i < m_dataSize; i++)
+					output.write_int(64, mp_data[i]);
+			}
 		}
 
 		virtual void read(bytestream& input, int depth, size_tracker& size_tracker) override {
@@ -576,7 +587,8 @@ namespace nbt {
 			if (m_dataSize) {
 				size_tracker.read(8 * 8 * m_dataSize);
 				mp_data = new std::int64_t[m_dataSize];
-				input.read_to((uint8*)mp_data, m_dataSize * 8);
+				for (int i = 0; i < m_dataSize; i++)
+					mp_data[i] = input.read_int(64);
 			}
 		}
 
@@ -615,7 +627,7 @@ namespace nbt {
 			uint32 size = input.read_int(16);
 			size_tracker.read(16 * size);
 			uint8* buffer = input.read(size);
-			m_data.assign((const char*)buffer);
+			m_data.assign((const char*)buffer, size);
 			free(buffer);
 		}
 
@@ -638,8 +650,9 @@ namespace nbt {
 			tag_string name_proxy{};
 			std::uint8_t id;
 			for (auto it = m_tagMap.begin(); it != m_tagMap.end(); it++) {
-				output.write_int(8, id = it->second->get_id());
+				id = it->second->get_id();
 				if (id != 0) {//!=end
+					output.write_int(8, id);
 					name_proxy.m_data = it->first;
 					name_proxy.write(output);
 					it->second->write(output);
@@ -662,6 +675,7 @@ namespace nbt {
 					throw exception("error reading compound tag: tag id invalid. corrupt tag?");
 				tag->read(input, depth + 1, size_tracker);
 				m_tagMap.insert(std::make_pair(name_proxy.m_data, tag));
+				size_tracker.read(288);
 			}
 		}
 
@@ -806,7 +820,45 @@ namespace nbt {
 	inline void read_tag_compound(bytestream& input, tag_compound& output, size_tracker& tracker) {
 		endian e = input.get_endian();
 		input.set_endian(BIG_ENDIAN);
-		if (input.read_int(8) != output.get_id())
+		std::int8_t head = input.read_int(8);
+#ifndef _NBT_NO_COMPRESS //TODO ADD THIS TO OTHER READ TAG (NON COMPOUND), OR MAKE INTO A FUNCTION
+		if (head == _NBT_GZIP_MAGIC) {//compressed
+			input.seek_beg(input.get_position() - 1);
+			z_stream stream = { 0 };
+			uint8* in = input.read((uint32)input.get_stream_size());//load it all, nbt depth prevents bigger files. shouldnt be >1gb
+			byteoutstream out_buf = byteoutstream(_NBT_GZIP_CHUNK);
+			out_buf.keep_buffer(true);
+			uint8 out[_NBT_GZIP_CHUNK];
+			memset(out, 0, _NBT_GZIP_CHUNK);
+			stream.zalloc = Z_NULL;
+			stream.zfree = Z_NULL;
+			stream.opaque = 0;
+			stream.avail_in = 0;
+			stream.next_in = in;
+			uint64 z=0;
+			int stat;
+			stream.avail_in = (uint32)input.get_stream_size();
+			inflateInit2(&stream, 47);//15, add mask of 32 (1bit) to enable gz
+			do {
+				stream.avail_out = _NBT_GZIP_CHUNK;
+				stream.next_out = out;
+				stat = inflate(&stream, Z_NO_FLUSH);
+				if (!(stat == Z_OK || stat == Z_STREAM_END || stat == Z_BUF_ERROR)) {
+					inflateEnd(&stream);
+					throw exception("bad gzip compressed data");
+				}
+				z += (_NBT_GZIP_CHUNK - stream.avail_out);
+				out_buf.write(out, _NBT_GZIP_CHUNK - stream.avail_out);
+
+			} while (stream.avail_out == 0);
+			inflateEnd(&stream);
+			free(in);
+			bytestream nstream = bytestream(out_buf.get_buffer(), z);
+			read_tag_compound(nstream, output, tracker);
+			return;
+		}
+#endif
+		if (head != output.get_id())
 			throw exception("not a compound tag");
 		input.seek_cur(input.read_int(16));
 		output.read(input, 0, tracker);
