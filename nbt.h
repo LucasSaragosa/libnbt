@@ -804,9 +804,46 @@ namespace nbt {
 	inline base* read_tag(bytestream& input, size_tracker& tracker) {
 		endian e = input.get_endian();
 		input.set_endian(BIG_ENDIAN);
-		base* tag = base::create((std::int8_t)input.read_int(8));
+		std::int8_t head = input.read();
+#ifndef _NBT_NO_COMPRESS
+		if (head == _NBT_GZIP_MAGIC) {//compressed
+			input.seek_beg(input.get_position() - 1);
+			z_stream stream = { 0 };
+			uint8* in = input.read((uint32)input.get_stream_size());//load it all, nbt depth prevents bigger files. shouldnt be >1gb
+			byteoutstream out_buf = byteoutstream(_NBT_GZIP_CHUNK);
+			out_buf.keep_buffer(true);
+			uint8 out[_NBT_GZIP_CHUNK];
+			memset(out, 0, _NBT_GZIP_CHUNK);
+			stream.zalloc = Z_NULL;
+			stream.zfree = Z_NULL;
+			stream.opaque = 0;
+			stream.avail_in = 0;
+			stream.next_in = in;
+			uint64 z = 0;
+			int stat;
+			stream.avail_in = (uint32)input.get_stream_size();
+			inflateInit2(&stream, 47);//15, add mask of 32 (1bit) to enable gz
+			do {
+				stream.avail_out = _NBT_GZIP_CHUNK;
+				stream.next_out = out;
+				stat = inflate(&stream, Z_NO_FLUSH);
+				if (!(stat == Z_OK || stat == Z_STREAM_END || stat == Z_BUF_ERROR)) {
+					inflateEnd(&stream);
+					throw exception("bad gzip compressed data");
+				}
+				z += (_NBT_GZIP_CHUNK - stream.avail_out);
+				out_buf.write(out, _NBT_GZIP_CHUNK - stream.avail_out);
+
+			} while (stream.avail_out == 0);
+			inflateEnd(&stream);
+			free(in);
+			bytestream nstream = bytestream(out_buf.get_buffer(), z);
+			return read_tag(nstream, tracker);
+		}
+#endif
+		base* tag = base::create((std::int8_t)head);
 		if (!tag)
-			throw exception("tag not created");
+			throw exception("tag not created (invalid/out of mem)");
 		input.seek_cur(input.read_int(16));
 		tag->read(input, 0, tracker);
 		input.set_endian(e);
@@ -821,7 +858,7 @@ namespace nbt {
 		endian e = input.get_endian();
 		input.set_endian(BIG_ENDIAN);
 		std::int8_t head = input.read_int(8);
-#ifndef _NBT_NO_COMPRESS //TODO ADD THIS TO OTHER READ TAG (NON COMPOUND), OR MAKE INTO A FUNCTION
+#ifndef _NBT_NO_COMPRESS
 		if (head == _NBT_GZIP_MAGIC) {//compressed
 			input.seek_beg(input.get_position() - 1);
 			z_stream stream = { 0 };
