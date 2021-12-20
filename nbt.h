@@ -838,6 +838,7 @@ namespace nbt {
 			inflateEnd(&stream);
 			free(in);
 			bytestream nstream = bytestream(out_buf.get_buffer(), z);
+			input.set_endian(e);
 			return read_tag(nstream, tracker);
 		}
 #endif
@@ -892,6 +893,7 @@ namespace nbt {
 			free(in);
 			bytestream nstream = bytestream(out_buf.get_buffer(), z);
 			read_tag_compound(nstream, output, tracker);
+			input.set_endian(e);
 			return;
 		}
 #endif
